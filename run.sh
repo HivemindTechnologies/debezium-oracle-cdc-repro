@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # usage: ./run.sh restart|ddl|ddl-caught-up [key=value ...]
 #   key=value pairs override connector.json, e.g. snapshot.mode=no_data
+#   DDL="..." replaces the DDL; COL becomes a column name unique to the run
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -8,6 +9,8 @@ scenario=${1:?usage: ./run.sh restart|ddl|ddl-caught-up [key=value ...]}
 shift
 run=r$(date +%H%M%S)   # tags the rows and names the connector and its topics
 api=http://localhost:8083
+ddl=${DDL:-ALTER TABLE APP.EVENTS ADD COL VARCHAR2(40 CHAR)}
+ddl=${ddl//COL/X_$run}
 
 sql() { docker compose exec -T oracle sqlplus -s app/app@localhost:1521/FREEPDB1; }
 
@@ -94,6 +97,7 @@ report() {
 }
 
 echo "== $scenario ($run) overrides: ${*:-none}"
+[ "$scenario" = restart ] || echo "DDL: $ddl"
 start_connector "$@"
 insert before 50
 wait_for 120 all_delivered before
@@ -117,7 +121,7 @@ case "$scenario" in
     # rows keep coming while the DDL runs, so the connector is a few seconds behind
     insert during 100 0.1 &
     sleep 5
-    sql >/dev/null <<< "ALTER TABLE APP.EVENTS ADD X_$run VARCHAR2(40 CHAR);"
+    sql >/dev/null <<< "$ddl;"
     wait
     auto_restart
     insert after 50
@@ -127,7 +131,7 @@ case "$scenario" in
     ;;
 
   ddl-caught-up)
-    sql >/dev/null <<< "ALTER TABLE APP.EVENTS ADD X_$run VARCHAR2(40 CHAR);"
+    sql >/dev/null <<< "$ddl;"
     insert after 50
     sleep 20
     report before after

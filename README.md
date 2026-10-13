@@ -26,6 +26,12 @@ docker compose up -d            # first start ~3 min
 docker compose down -v          # remove everything
 ```
 
+`DDL="..."` replaces the DDL of the `ddl` scenarios; `COL` becomes a fresh column name:
+
+```bash
+DDL="ALTER TABLE APP.EVENTS ADD (COL VARCHAR2(1 CHAR) DEFAULT 'N' NOT NULL)" ./run.sh ddl
+```
+
 `connector.json` holds the tested configuration, close to production (`lob.enabled=true`,
 `online_catalog`, filter mode `in`, the production snapshot settings). Edit it, or override
 single keys on the command line as above. Each run creates a fresh connector.
@@ -84,9 +90,6 @@ differ, everything in between is skipped.
 - With `online_catalog`, LogMiner decodes old redo with the table's current definition. Rows
   written before the DDL and read after it come back as `Dictionary Mismatch`, permanently.
 
-The same code is in Debezium 3.4.1 and 3.6.1.
-
 ## Limits
 
-Oracle 23ai Free, one instance, one captured table. Production runs Oracle 19c on RAC with ~120
-tables. The `ddl` scenario uses a plain `ADD COLUMN`; other DDL is untested here.
+The `ddl` scenario uses a plain `ADD COLUMN`; other DDL is untested here.
