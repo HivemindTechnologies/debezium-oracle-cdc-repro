@@ -77,13 +77,14 @@ auto_restart() {
   done
 }
 
-# where the last task start resumed, from the Debezium log
+# where the last task start resumed, from the Debezium log (empty if the task never restarted)
 resume_point() {
   docker compose logs --since "$1" connect 2>/dev/null | grep -o -E \
     'Found previous offset OracleOffsetContext \[scn=[0-9]+|Snapshot ended with SnapshotResult \[status=[A-Z]+, offset=OracleOffsetContext \[scn=[0-9]+' \
     | tail -2 | sed -E \
       -e 's/Found previous offset OracleOffsetContext \[scn=/stored offset   scn=/' \
-      -e 's/Snapshot ended with SnapshotResult \[status=([A-Z]+), offset=OracleOffsetContext \[scn=/resumed from    scn=/'
+      -e 's/Snapshot ended with SnapshotResult \[status=([A-Z]+), offset=OracleOffsetContext \[scn=/resumed from    scn=/' \
+    || true   # no restart, nothing to show
 }
 
 report() {
