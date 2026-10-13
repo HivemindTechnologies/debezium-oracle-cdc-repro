@@ -1,0 +1,25 @@
+{
+  "connector.class": "io.debezium.connector.oracle.OracleConnector",
+  "tasks.max": "1",
+  "database.hostname": "oracle",
+  "database.port": "1521",
+  "database.user": "C##DBZUSER",
+  "database.password": "dbz",
+  "database.dbname": "FREE",
+  "database.pdb.name": "FREEPDB1",
+  "table.include.list": "APP.EVENTS",
+  "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+  "topic.creation.default.replication.factor": "1",
+  "topic.creation.default.partitions": "1",
+
+  "log.mining.strategy": "online_catalog",
+  "log.mining.query.filter.mode": "in",
+  "lob.enabled": "true",
+
+  "snapshot.mode": "configuration_based",
+  "snapshot.mode.configuration.based.snapshot.schema": "true",
+  "snapshot.mode.configuration.based.snapshot.data": "false",
+  "snapshot.mode.configuration.based.start.stream": "true",
+  "snapshot.mode.configuration.based.snapshot.on.schema.error": "false",
+  "snapshot.mode.configuration.based.snapshot.on.data.error": "false"
+}
