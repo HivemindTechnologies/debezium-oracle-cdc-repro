@@ -16,6 +16,10 @@
   "log.mining.query.filter.mode": "in",
   "lob.enabled": "true",
 
+  "post.processors": "reselector",
+  "post.processors.reselector.type": "io.debezium.processors.reselect.ReselectColumnsPostProcessor",
+  "post.processors.reselector.reselect.columns.include.list": "APP.EVENTS:EV_DATA",
+
   "snapshot.mode": "configuration_based",
   "snapshot.mode.configuration.based.snapshot.schema": "true",
   "snapshot.mode.configuration.based.snapshot.data": "false",

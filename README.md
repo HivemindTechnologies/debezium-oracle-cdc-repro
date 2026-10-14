@@ -33,13 +33,14 @@ DDL="ALTER TABLE APP.EVENTS ADD (COL VARCHAR2(1 CHAR) DEFAULT 'N' NOT NULL)" ./r
 ```
 
 `connector.json` holds the tested configuration, close to production (`lob.enabled=true`,
-`online_catalog`, filter mode `in`, the production snapshot settings). Edit it, or override
+`online_catalog`, filter mode `in`, the CLOB reselector, the production snapshot settings). Edit it, or override
 single keys on the command line as above. Each run creates a fresh connector.
 
 ## Scenarios
 
-Every run first inserts 50 rows (`before`) and waits until they are in Kafka and the offset is
-stored. Then:
+Every row gets an 8 KB CLOB that starts with the row's name, so the report can count rows whose
+CLOB arrived intact (`clob-ok`). Every run first inserts 50 rows (`before`) and waits until they
+are in Kafka and the offset is stored. Then:
 
 | Scenario | What happens |
 |---|---|
@@ -49,36 +50,25 @@ stored. Then:
 
 ## Results (Debezium 3.6.1)
 
-```
-== restart, production config               == restart, snapshot.mode=no_data
-stored offset   scn=2277590                  stored offset   scn=2279626
-resumed from    scn=2278191                  resumed from    scn=2279626
-task: RUNNING                                task: RUNNING
-phase        db  kafka                       phase        db  kafka
-before       50     50                       before       50     50
-down         50      0   <- lost             down         50     50
-after        50     50                       after        50     50
+Rows of the `down` or `during` phase that reached Kafka, and how many of them carried their own
+CLOB (out of 50 or 100):
 
-== ddl, production config                   == ddl, snapshot.mode=no_data
-task FAILED: Oracle LogMiner is unable to    task FAILED: Oracle LogMiner is unable to
-  re-construct the SQL for 'INSERT' …          re-construct the SQL for 'INSERT' …  (every restart)
-stored offset   scn=2284976                  stored offset   scn=2289411
-resumed from    scn=2286687                  resumed from    scn=2289411
-task: RUNNING                                task: FAILED
-phase        db  kafka                       phase        db  kafka
-before       50     50                       before       50     50
-during      100     17   <- 83 lost          during      100     15   <- waiting, not lost
-after        50     50                       after        50      0   <- waiting, not lost
+| Run | Task at the end | stored → resumed SCN | down / during | CLOB ok |
+|---|---|---|---|---|
+| `restart` | RUNNING | 2748084 → **2748685** | **0 / 50** | 0 |
+| `restart snapshot.mode=no_data` | RUNNING | 2749305 → 2749305 | 50 / 50 | 50 |
+| `ddl` | RUNNING after 1 restart | 2761861 → **2762321** | **26 / 100** | 26 |
+| `ddl snapshot.mode=no_data` | FAILED on every restart | 2759311 → 2759311 | 40 / 100, rest waiting | 40 |
+| `ddl snapshot.mode=no_data log.mining.strategy=hybrid lob.enabled=false` | RUNNING, never failed | | 100 / 100 | **86** |
+| `restart snapshot.mode=no_data log.mining.strategy=hybrid lob.enabled=false` | RUNNING | 2757292 → 2757292 | 50 / 50 | 50 |
+| `ddl-caught-up` | RUNNING, never failed | | 50 / 50 (`after`) | 50 |
 
-== ddl-caught-up, production config
-task: RUNNING
-phase        db  kafka
-before       50     50
-after        50     50
-```
+`stored` is where the connector stopped, `resumed` where it continued. If they differ,
+everything in between is skipped.
 
-`stored offset` is where the connector stopped, `resumed from` is where it continued. If they
-differ, everything in between is skipped.
+With `hybrid`, the 14 rows written just before the DDL and read after it (`during:36` to
+`during:49`) arrived with an empty string as CLOB. The reselector does not replace empty
+strings, so those CLOBs are lost until a snapshot repairs them.
 
 ## Why
 

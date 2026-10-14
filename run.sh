@@ -14,12 +14,14 @@ ddl=${ddl//COL/X_$run}
 
 sql() { docker compose exec -T oracle sqlplus -s app/app@localhost:1521/FREEPDB1; }
 
-# insert <phase> <rows> [seconds between rows], one commit per row
+# insert <phase> <rows> [seconds between rows], one commit per row.
+# The 8 KB CLOB starts with the row's name, so Kafka can show whether each row got its own CLOB.
 insert() {
   sql >/dev/null <<SQL
-DECLARE v CLOB := RPAD('x', 8000, 'x');
+DECLARE v CLOB;
 BEGIN
   FOR i IN 1 .. $2 LOOP
+    v := RPAD('$run:$1:' || i || ':', 8000, 'x');
     INSERT INTO APP.EVENTS (EV_SITE, EV_ID, EV_NAME, EV_DATA)
     VALUES ('A', APP.EVENTS_SEQ.NEXTVAL, '$run:$1:' || i, v);
     COMMIT;
@@ -30,16 +32,32 @@ END;
 SQL
 }
 
+# The DDL waits up to 30 s for the table lock, as ongoing inserts hold it briefly; without the
+# timeout it fails with ORA-00054. Any error aborts the run.
+run_ddl() {
+  local out
+  out=$(sql <<< "WHENEVER SQLERROR EXIT FAILURE
+ALTER SESSION SET DDL_LOCK_TIMEOUT = 30;
+$ddl;") || { echo "$out" >&2; exit 1; }
+}
+
 in_db() {
   sql <<< "SET HEADING OFF FEEDBACK OFF
 SELECT COUNT(*) FROM APP.EVENTS WHERE EV_NAME LIKE '$run:$1:%';" | tr -d '[:space:]'
 }
 
-in_kafka() {
+# one line per insert event in Kafka: "<row name> ok|bad", ok if the CLOB belongs to the row
+kafka_rows() {
   docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server kafka:9092 --topic "$run.APP.EVENTS" --from-beginning --timeout-ms 10000 2>/dev/null \
-    | jq -r 'select(.op == "c") | .after.EV_NAME' | grep "^$run:$1:" | sort -u | wc -l
+    | jq -r 'select(.op == "c") | .after | .EV_NAME as $n
+             | "\($n) \(if (.EV_DATA // "" | startswith($n + ":")) then "ok" else "bad" end)"'
 }
+
+# count <phase> [ok] from kafka_rows output on stdin: rows in Kafka, or rows with a correct CLOB
+count() { grep "^$run:$1:[0-9]* ${2:-}" | cut -d' ' -f1 | sort -u | wc -l; }
+
+in_kafka() { kafka_rows | count "$1"; }
 
 step() { echo "$(date +%T)  $*"; }
 
@@ -98,9 +116,12 @@ resume_point() {
 report() {
   step "counting rows in the database and in Kafka"
   echo
+  local rows; rows=$(kafka_rows)
   echo "task: $(state)"
-  printf '%-8s %6s %6s\n' phase db kafka
-  for phase in "$@"; do printf '%-8s %6s %6s\n' "$phase" "$(in_db "$phase")" "$(in_kafka "$phase")"; done
+  printf '%-8s %6s %6s %8s\n' phase db kafka clob-ok
+  for phase in "$@"; do
+    printf '%-8s %6s %6s %8s\n' "$phase" "$(in_db "$phase")" "$(count "$phase" <<< "$rows")" "$(count "$phase" ok <<< "$rows")"
+  done
 }
 
 echo "== $scenario ($run) overrides: ${*:-none}"
@@ -136,7 +157,7 @@ case "$scenario" in
     insert during 100 0.1 &
     sleep 5
     step "running the DDL"
-    sql >/dev/null <<< "$ddl;"
+    run_ddl
     wait
     auto_restart
     step "inserting 50 rows (after), waiting 20 s"
@@ -148,7 +169,7 @@ case "$scenario" in
 
   ddl-caught-up)
     step "running the DDL"
-    sql >/dev/null <<< "$ddl;"
+    run_ddl
     step "inserting 50 rows (after), waiting 20 s"
     insert after 50
     sleep 20
