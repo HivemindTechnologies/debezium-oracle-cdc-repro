@@ -60,15 +60,17 @@ CLOB (out of 50 or 100):
 | `ddl` | RUNNING after 1 restart | 2761861 → **2762321** | **26 / 100** | 26 |
 | `ddl snapshot.mode=no_data` | FAILED on every restart | 2759311 → 2759311 | 40 / 100, rest waiting | 40 |
 | `ddl snapshot.mode=no_data log.mining.strategy=hybrid lob.enabled=false` | RUNNING, never failed | | 100 / 100 | **86** |
+| `ddl snapshot.mode=no_data log.mining.strategy=hybrid lob.enabled=false unavailable.value.placeholder=` | RUNNING, never failed | | 100 / 100 | **100** |
 | `restart snapshot.mode=no_data log.mining.strategy=hybrid lob.enabled=false` | RUNNING | 2757292 → 2757292 | 50 / 50 | 50 |
 | `ddl-caught-up` | RUNNING, never failed | | 50 / 50 (`after`) | 50 |
 
 `stored` is where the connector stopped, `resumed` where it continued. If they differ,
 everything in between is skipped.
 
-With `hybrid`, the 14 rows written just before the DDL and read after it (`during:36` to
-`during:49`) arrived with an empty string as CLOB. The reselector does not replace empty
-strings, so those CLOBs are lost until a snapshot repairs them.
+With `hybrid`, the rows written just before the DDL and read after it (14 and 12 rows in two
+runs) arrive with an empty string as CLOB, and the reselector only replaces NULL and the
+placeholder. Setting the placeholder to the empty string (`unavailable.value.placeholder=`)
+makes the reselector replace those values as well: 100 of 100 in two runs.
 
 ## Why
 
