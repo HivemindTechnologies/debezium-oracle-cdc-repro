@@ -76,6 +76,7 @@ wait_for() {
 
 api_up() { curl -sf "$api/connectors"; }
 running() { [ "$(state)" = RUNNING ]; }
+started() { [ "$(state)" = RUNNING ] || [ "$(state)" = FAILED ]; }
 offset_stored() { curl -s "$api/connectors/$run/offsets" | jq -e '.offsets | length > 0'; }
 # the task reports RUNNING before its startup snapshot is done; streaming starts after it
 streaming() { docker compose logs --since "$since" connect | grep -q 'Starting streaming'; }
@@ -85,12 +86,19 @@ start_connector() {
   step "waiting for Kafka Connect"
   wait_for 300 api_up
   step "starting connector $run"
+  local t0; t0=$(date -u +%FT%TZ)
   for old in $(curl -s "$api/connectors" | jq -r '.[]'); do curl -s -X DELETE "$api/connectors/$old"; done
   jq -n --args '$ARGS.positional | map(split("=") | {(.[0]): (.[1:] | join("="))}) | add // {}' "$@" \
     | jq --arg run "$run" --slurpfile base "$config" \
         '{name: $run, config: ($base[0] + {"topic.prefix": $run, "schema.history.internal.kafka.topic": "\($run).history"} + .)}' \
-    | curl -sf -X POST -H 'Content-Type: application/json' --data @- "$api/connectors" >/dev/null
-  wait_for 120 running
+    | curl -s --fail-with-body -X POST -H 'Content-Type: application/json' --data @- "$api/connectors" >/tmp/connector-response.json \
+    || { echo "connector rejected: $(jq -r .message /tmp/connector-response.json)" >&2; exit 1; }
+  wait_for 120 started
+  if [ "$(state)" = FAILED ]; then
+    # e.g. an invalid combination of settings; Debezium explains it in its first ERROR line
+    echo "task FAILED: $(docker compose logs --since "$t0" connect | grep -m1 ' ERROR ' | sed -E 's/.*ERROR +[^ ]+ +//')" >&2
+    exit 1
+  fi
 }
 
 # restart a FAILED task up to 3 times, as an external auto-restart would

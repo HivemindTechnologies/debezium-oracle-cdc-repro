@@ -9,32 +9,29 @@ Two things lose change events in the production setup:
    `Oracle LogMiner is unable to re-construct the SQL for 'INSERT' event`. The next restart
    then skips everything since the stored offset.
 
-`snapshot.mode=no_data` fixes the first and turns the second into a connector that stays
-FAILED, with nothing lost.
+The recommended configuration loses nothing in either case.
 
 ## Run
 
 Needs Docker, `jq` and `curl`.
 
 ```bash
-docker compose up -d            # first start ~3 min
-./run.sh restart                # restart, production config
-./run.sh restart snapshot.mode=no_data
-./run.sh ddl                    # DDL while the connector is a few seconds behind
-./run.sh ddl snapshot.mode=no_data
-./run.sh ddl-caught-up          # DDL while the connector is idle
-docker compose down -v          # remove everything
+docker compose up -d                         # first start ~3 min
+./run.sh restart production.json             # restart
+./run.sh ddl production.json                 # DDL while the connector is a few seconds behind
+./run.sh ddl-caught-up production.json       # DDL while the connector is idle
+./run.sh ddl recommended.json                # any scenario, recommended configuration
+docker compose down -v                       # remove everything
 ```
 
-`DDL="..."` replaces the DDL of the `ddl` scenarios; `COL` becomes a fresh column name:
+| File | Configuration |
+|---|---|
+| `production.json` | as in production: `lob.enabled=true`, `online_catalog`, filter mode `in`, CLOB reselector, `snapshot.mode=configuration_based` with `snapshot.schema=true` |
+| `recommended.json` | the same with `snapshot.mode=no_data`, `log.mining.strategy=hybrid`, `lob.enabled=false`, `unavailable.value.placeholder=""` |
 
-```bash
-DDL="ALTER TABLE APP.EVENTS ADD (COL VARCHAR2(1 CHAR) DEFAULT 'N' NOT NULL)" ./run.sh ddl
-```
-
-`connector.json` holds the tested configuration, close to production (`lob.enabled=true`,
-`online_catalog`, filter mode `in`, the CLOB reselector, the production snapshot settings). Edit it, or override
-single keys on the command line as above. Each run creates a fresh connector.
+Single keys can be overridden after the file, e.g. `./run.sh ddl recommended.json lob.enabled=true`.
+`DDL="..."` replaces the DDL; `COL` becomes a fresh column name. Each run creates a fresh
+connector.
 
 ## Scenarios
 
@@ -45,32 +42,27 @@ are in Kafka and the offset is stored. Then:
 | Scenario | What happens |
 |---|---|
 | `restart` | Kafka Connect is stopped, 50 rows are inserted (`down`), Connect starts, 50 more rows (`after`) |
-| `ddl` | 100 rows are inserted at 10 per second (`during`); after 5 s `ALTER TABLE … ADD … VARCHAR2(40 CHAR)` runs; a FAILED task is restarted up to 3 times, like an external auto-restart; 50 more rows (`after`) |
-| `ddl-caught-up` | the same `ALTER TABLE`, then 50 rows (`after`) |
+| `ddl` | 100 rows are inserted at 10 per second (`during`); after 5 s the DDL runs; a FAILED task is restarted up to 3 times, like an external auto-restart; 50 more rows (`after`) |
+| `ddl-caught-up` | the DDL runs, then 50 rows (`after`) |
 
-## Results (Debezium 3.6.1)
+## Results (Debezium 3.7.0)
 
-Rows of the `down` or `during` phase that reached Kafka, and how many of them carried their own
-CLOB (out of 50 or 100):
+Rows of the `down`, `during` or `after` phase in Kafka, with their own CLOB:
 
-| Run | Task at the end | stored → resumed SCN | down / during | CLOB ok |
-|---|---|---|---|---|
-| `restart` | RUNNING | 2748084 → **2748685** | **0 / 50** | 0 |
-| `restart snapshot.mode=no_data` | RUNNING | 2749305 → 2749305 | 50 / 50 | 50 |
-| `ddl` | RUNNING after 1 restart | 2761861 → **2762321** | **26 / 100** | 26 |
-| `ddl snapshot.mode=no_data` | FAILED on every restart | 2759311 → 2759311 | 40 / 100, rest waiting | 40 |
-| `ddl snapshot.mode=no_data log.mining.strategy=hybrid lob.enabled=false` | RUNNING, never failed | | 100 / 100 | **86** |
-| `ddl snapshot.mode=no_data log.mining.strategy=hybrid lob.enabled=false unavailable.value.placeholder=` | RUNNING, never failed | | 100 / 100 | **100** |
-| `restart snapshot.mode=no_data log.mining.strategy=hybrid lob.enabled=false` | RUNNING | 2757292 → 2757292 | 50 / 50 | 50 |
-| `ddl-caught-up` | RUNNING, never failed | | 50 / 50 (`after`) | 50 |
+| Run | `production.json` | `recommended.json` |
+|---|---|---|
+| `restart` | **0 / 50**, resumed at 2301595 instead of 2300998 | 50 / 50 |
+| `ddl`, `ADD COL VARCHAR2(40 CHAR)` | **36 / 100**, failed, restart skipped to 2304178 | 100 / 100, never failed |
+| `ddl`, `ADD (COL … DEFAULT 'N' NOT NULL, COL_C …, CONSTRAINT … CHECK …)` | **33 / 100**, failed, restart skipped to 2309012 | 100 / 100, never failed |
+| `ddl-caught-up` | 50 / 50 | 50 / 50 |
 
-`stored` is where the connector stopped, `resumed` where it continued. If they differ,
-everything in between is skipped.
+Each run prints `stored offset` (where the connector stopped) and `resumed from` (where it
+continued). If they differ, everything in between is skipped.
 
-With `hybrid`, the rows written just before the DDL and read after it (14 and 12 rows in two
-runs) arrive with an empty string as CLOB, and the reselector only replaces NULL and the
-placeholder. Setting the placeholder to the empty string (`unavailable.value.placeholder=`)
-makes the reselector replace those values as well: 100 of 100 in two runs.
+Debezium 3.6.1 behaves the same, with one exception: it cannot parse `ADD (…, CONSTRAINT …
+CHECK …)` and fails with `Invalid value: null used for required field: "typeName"`, in both
+configurations and even when caught up ([dbz#2405](https://github.com/debezium/dbz/issues/2405),
+fixed in 3.7.0).
 
 ## Why
 
@@ -81,7 +73,6 @@ makes the reselector replace those values as well: 100 of 100 in two runs.
   inherits the default `true`, so the snapshot's current SCN replaces the offset.
 - With `online_catalog`, LogMiner decodes old redo with the table's current definition. Rows
   written before the DDL and read after it come back as `Dictionary Mismatch`, permanently.
-
-## Limits
-
-The `ddl` scenario uses a plain `ADD COLUMN`; other DDL is untested here.
+  `hybrid` rebuilds them from Debezium's own schema history instead.
+- `hybrid` rebuilds the CLOB of such rows as an empty string. The reselector replaces only NULL
+  and the placeholder, so the placeholder is set to the empty string as well.
