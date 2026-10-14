@@ -41,6 +41,8 @@ in_kafka() {
     | jq -r 'select(.op == "c") | .after.EV_NAME' | grep "^$run:$1:" | sort -u | wc -l
 }
 
+step() { echo "$(date +%T)  $*"; }
+
 state() { curl -s "$api/connectors/$run/status" | jq -r '.tasks[0].state // "STARTING"'; }
 
 # wait_for <seconds> <command...>: poll until the command succeeds
@@ -60,7 +62,9 @@ streaming() { docker compose logs --since "$since" connect | grep -q 'Starting s
 all_delivered() { [ "$(in_kafka "$1")" -eq "$(in_db "$1")" ]; }
 
 start_connector() {
+  step "waiting for Kafka Connect"
   wait_for 300 api_up
+  step "starting connector $run"
   for old in $(curl -s "$api/connectors" | jq -r '.[]'); do curl -s -X DELETE "$api/connectors/$old"; done
   jq -n --args '$ARGS.positional | map(split("=") | {(.[0]): (.[1:] | join("="))}) | add // {}' "$@" \
     | jq --arg run "$run" --slurpfile base connector.json \
@@ -71,12 +75,13 @@ start_connector() {
 
 # restart a FAILED task up to 3 times, as an external auto-restart would
 auto_restart() {
-  for _ in 1 2 3; do
+  for i in 1 2 3; do
+    step "checking task in 20 s ($i/3)"
     sleep 20
-    running && continue
-    echo "task FAILED: $(curl -s "$api/connectors/$run/status" | jq -r '.tasks[0].trace' | grep -m1 -o 'Oracle LogMiner is unable.*')"
+    running && { step "task RUNNING"; continue; }
+    step "task FAILED: $(curl -s "$api/connectors/$run/status" | jq -r '.tasks[0].trace' | grep -m1 -o 'Oracle LogMiner is unable.*')"
     curl -sf -X POST "$api/connectors/$run/tasks/0/restart"
-    echo "task restarted"
+    step "task restarted"
   done
 }
 
@@ -91,6 +96,8 @@ resume_point() {
 }
 
 report() {
+  step "counting rows in the database and in Kafka"
+  echo
   echo "task: $(state)"
   printf '%-8s %6s %6s\n' phase db kafka
   for phase in "$@"; do printf '%-8s %6s %6s\n' "$phase" "$(in_db "$phase")" "$(in_kafka "$phase")"; done
@@ -99,7 +106,9 @@ report() {
 echo "== $scenario ($run) overrides: ${*:-none}"
 [ "$scenario" = restart ] || echo "DDL: $ddl"
 start_connector "$@"
+step "inserting 50 rows (before)"
 insert before 50
+step "waiting until they are in Kafka and the offset is stored"
 wait_for 120 all_delivered before
 wait_for 60 offset_stored
 sleep 6   # one more offset flush, so the stored offset covers all "before" rows
@@ -107,10 +116,14 @@ since=$(date -u +%FT%TZ)
 
 case "$scenario" in
   restart)
+    step "stopping Kafka Connect"
     docker compose stop connect >/dev/null 2>&1
+    step "inserting 50 rows while it is down (down)"
     insert down 50
+    step "starting Kafka Connect, waiting for streaming"
     docker compose start connect >/dev/null 2>&1
     wait_for 300 streaming
+    step "inserting 50 rows (after), waiting 20 s"
     insert after 50
     sleep 20
     resume_point "$since"
@@ -119,11 +132,14 @@ case "$scenario" in
 
   ddl)
     # rows keep coming while the DDL runs, so the connector is a few seconds behind
+    step "inserting 100 rows over 10 s (during)"
     insert during 100 0.1 &
     sleep 5
+    step "running the DDL"
     sql >/dev/null <<< "$ddl;"
     wait
     auto_restart
+    step "inserting 50 rows (after), waiting 20 s"
     insert after 50
     sleep 20
     resume_point "$since"
@@ -131,7 +147,9 @@ case "$scenario" in
     ;;
 
   ddl-caught-up)
+    step "running the DDL"
     sql >/dev/null <<< "$ddl;"
+    step "inserting 50 rows (after), waiting 20 s"
     insert after 50
     sleep 20
     report before after
