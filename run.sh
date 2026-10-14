@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# usage: ./run.sh restart|ddl|ddl-caught-up [key=value ...]
-#   key=value pairs override connector.json, e.g. snapshot.mode=no_data
+# usage: ./run.sh restart|ddl|ddl-caught-up production.json|recommended.json [key=value ...]
+#   key=value pairs override single keys of the config file, e.g. snapshot.mode=no_data
 #   DDL="..." replaces the DDL; COL becomes a column name unique to the run
 set -euo pipefail
 cd "$(dirname "$0")"
 
-scenario=${1:?usage: ./run.sh restart|ddl|ddl-caught-up [key=value ...]}
-shift
+usage="usage: ./run.sh restart|ddl|ddl-caught-up production.json|recommended.json [key=value ...]"
+scenario=${1:?$usage}
+config=${2:?$usage}
+shift 2
 run=r$(date +%H%M%S)   # tags the rows and names the connector and its topics
 api=http://localhost:8083
 ddl=${DDL:-ALTER TABLE APP.EVENTS ADD COL VARCHAR2(40 CHAR)}
@@ -85,7 +87,7 @@ start_connector() {
   step "starting connector $run"
   for old in $(curl -s "$api/connectors" | jq -r '.[]'); do curl -s -X DELETE "$api/connectors/$old"; done
   jq -n --args '$ARGS.positional | map(split("=") | {(.[0]): (.[1:] | join("="))}) | add // {}' "$@" \
-    | jq --arg run "$run" --slurpfile base connector.json \
+    | jq --arg run "$run" --slurpfile base "$config" \
         '{name: $run, config: ($base[0] + {"topic.prefix": $run, "schema.history.internal.kafka.topic": "\($run).history"} + .)}' \
     | curl -sf -X POST -H 'Content-Type: application/json' --data @- "$api/connectors" >/dev/null
   wait_for 120 running
@@ -103,14 +105,16 @@ auto_restart() {
   done
 }
 
-# where the last task start resumed, from the Debezium log (empty if the task never restarted)
+# The offset stored before the disruption, and where the last task start continued (from the
+# Debezium log). If they differ, everything in between is skipped.
+stored_scn() { curl -s "$api/connectors/$run/offsets" | jq -r '.offsets[0].offset.scn'; }
 resume_point() {
-  docker compose logs --since "$1" connect 2>/dev/null | grep -o -E \
-    'Found previous offset OracleOffsetContext \[scn=[0-9]+|Snapshot ended with SnapshotResult \[status=[A-Z]+, offset=OracleOffsetContext \[scn=[0-9]+' \
-    | tail -2 | sed -E \
-      -e 's/Found previous offset OracleOffsetContext \[scn=/stored offset   scn=/' \
-      -e 's/Snapshot ended with SnapshotResult \[status=([A-Z]+), offset=OracleOffsetContext \[scn=/resumed from    scn=/' \
-    || true   # no restart, nothing to show
+  local resumed
+  resumed=$(docker compose logs --since "$since" connect 2>/dev/null \
+    | grep -o -E 'Snapshot ended with SnapshotResult \[status=[A-Z]+, offset=OracleOffsetContext \[scn=[0-9]+' \
+    | tail -1 | grep -o -E '[0-9]+$' || true)
+  echo "stored offset   scn=$stored"
+  echo "resumed from    scn=${resumed:-(no restart)}"
 }
 
 report() {
@@ -124,7 +128,7 @@ report() {
   done
 }
 
-echo "== $scenario ($run) overrides: ${*:-none}"
+echo "== $scenario $config ${*:-} ($run)"
 [ "$scenario" = restart ] || echo "DDL: $ddl"
 start_connector "$@"
 step "inserting 50 rows (before)"
@@ -134,6 +138,7 @@ wait_for 120 all_delivered before
 wait_for 60 offset_stored
 sleep 6   # one more offset flush, so the stored offset covers all "before" rows
 since=$(date -u +%FT%TZ)
+stored=$(stored_scn)
 
 case "$scenario" in
   restart)
@@ -147,7 +152,7 @@ case "$scenario" in
     step "inserting 50 rows (after), waiting 20 s"
     insert after 50
     sleep 20
-    resume_point "$since"
+    resume_point
     report before down after
     ;;
 
@@ -163,7 +168,7 @@ case "$scenario" in
     step "inserting 50 rows (after), waiting 20 s"
     insert after 50
     sleep 20
-    resume_point "$since"
+    resume_point
     report before during after
     ;;
 
