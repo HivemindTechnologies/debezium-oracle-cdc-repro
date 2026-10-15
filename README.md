@@ -16,16 +16,15 @@ Four layers on top of `production.json` fix this; with all four, nothing is lost
 Needs Docker, `jq` and `curl`.
 
 ```bash
-docker compose up -d                         # first start ~3 min
-./run.sh restart production.json             # restart
-./run.sh ddl production.json                 # DDL while the connector is a few seconds behind
-./run.sh ddl-caught-up production.json       # DDL while the connector is idle
-docker compose down -v                       # remove everything
+docker compose up -d        # first start ~3 min
+docker compose down -v      # remove everything at the end
 ```
 
-`production.json` is the configuration as in production: `lob.enabled=true`, `online_catalog`,
-filter mode `in`, the CLOB reselector, `snapshot.mode=configuration_based` with
-`snapshot.schema=true`. Each layer file holds one fix and is merged on top, left to right:
+`./run.sh <scenario> production.json [layer.json ...] [key=value ...]` creates a fresh connector,
+runs the scenario and prints what reached Kafka. `production.json` is the configuration as in
+production: `lob.enabled=true`, `online_catalog`, filter mode `in`, the CLOB reselector,
+`snapshot.mode=configuration_based` with `snapshot.schema=true`. Each layer file holds one fix and
+is merged on top, left to right; `key=value` pairs override single keys last.
 
 | Layer | Setting | Fixes |
 |---|---|---|
@@ -34,34 +33,97 @@ filter mode `in`, the CLOB reselector, `snapshot.mode=configuration_based` with
 | `3-hybrid.json` | `log.mining.strategy=hybrid` | a DDL no longer stops the connector |
 | `4-empty-placeholder.json` | `unavailable.value.placeholder=""` | rows rebuilt by `hybrid` get their CLOB from the reselector |
 
-`key=value` pairs after the files override single keys, e.g. `snapshot.mode=when_needed`.
-`DDL="..."` replaces the DDL; `COL` becomes a fresh column name. Each run creates a fresh
-connector.
+## Journey
 
-## Step by Step
+Each command runs on its own; copy them in order. The comment says what to look for.
 
-Add one layer at a time; each step fixes what the previous one showed:
+### 1. A Restart Loses Data
 
 ```bash
-L="production.json 1-no-data.json"
-./run.sh restart production.json      # rows written while Connect was down are lost
-./run.sh restart $L                   # nothing lost
-
-./run.sh ddl $L                       # DDL: task stays FAILED, nothing lost
-./run.sh ddl $L 3-hybrid.json         # rejected: hybrid needs lob.enabled=false
-
-L="$L 2-lob-disabled-reselector.json"
-./run.sh ddl $L 3-hybrid.json         # passes the DDL, some CLOBs arrive empty
-
-L="$L 3-hybrid.json 4-empty-placeholder.json"
-./run.sh ddl $L                       # all rows, all CLOBs
-./run.sh changes $L                   # updates and deletes: every row ends correct
+./run.sh restart production.json
 ```
+`down 50 0`: the 50 rows written while Connect was down never arrive; `resumed from` is higher
+than `stored offset`.
+
+```bash
+./run.sh restart production.json 1-no-data.json
+```
+`down 50 50`: the restart resumes at the stored offset.
+
+### 2. A DDL Stops the Connector
+
+```bash
+./run.sh ddl production.json
+```
+`task FAILED: … unable to re-construct the SQL …`, then the auto-restart skips ahead: most
+`during` rows are lost.
+
+```bash
+./run.sh ddl production.json 1-no-data.json
+```
+The task stays FAILED on every restart. Nothing is lost, but nothing moves either.
+
+```bash
+./run.sh ddl production.json 1-no-data.json 3-hybrid.json
+```
+Rejected at start: `hybrid` is not compatible with `lob.enabled=true`.
+
+```bash
+./run.sh ddl production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json
+```
+The DDL passes and all 100 `during` rows arrive, but about 14 of them with an empty CLOB.
+
+```bash
+./run.sh ddl production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
+```
+All rows, all CLOBs.
+
+### 3. Updates and Deletes With the Reselector
+
+```bash
+./run.sh changes production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
+```
+Every line ends in `ok`: each change in the table arrives with its CLOB version, and every row
+ends correct (kept rows on v2, deleted rows with a delete).
+
+```bash
+./run.sh changes production.json
+```
+`0 events` on every line: the restart skipped all changes.
+
+### 4. Archive Logs Deleted While the Connector Is Down
+
+```bash
+./run.sh archive-gone production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
+```
+`task FAILED: no longer available on the server`. It waits for someone to act.
+
+```bash
+./run.sh archive-gone production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json snapshot.mode=when_needed
+```
+A full snapshot of the table, then streaming: all 50 `gone` rows arrive.
+
+### 5. A Constraint in the Same Statement (Debezium 3.6.1)
+
+```bash
+DDL="ALTER TABLE APP.EVENTS ADD (COL VARCHAR2(1 CHAR) DEFAULT 'N' NOT NULL, CONSTRAINT COL_CK CHECK (COL IN ('N','Y')))" \
+  ./run.sh ddl-caught-up production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
+```
+FAILED with `Invalid value: null used for required field: "typeName"`, even with no lag.
+
+```bash
+DDL=$'ALTER TABLE APP.EVENTS ADD (COL VARCHAR2(1 CHAR) DEFAULT \'N\' NOT NULL);\nALTER TABLE APP.EVENTS ADD CONSTRAINT COL_CK CHECK (COL IN (\'N\',\'Y\'))' \
+  ./run.sh ddl production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
+```
+The same change as two statements passes, also with writes running.
+
+`DDL="..."` replaces the default DDL (`ADD COL VARCHAR2(40 CHAR)`); `COL` becomes a column name
+unique to the run.
 
 ## Scenarios
 
-Every row gets an 8 KB CLOB that starts with the row's name, so the report can count rows whose
-CLOB arrived intact (`clob-ok`). Every run first inserts 50 rows (`before`) and waits until they
+Every row gets an 8 KB CLOB that starts with the row's name and version (`…:7:x…` for v1,
+`…:7:v2:x…` for v2), so the report can tell which CLOB each event carried. Every run first inserts 50 rows (`before`) and waits until they
 are in Kafka and the offset is stored. Then:
 
 | Scenario | What happens |
@@ -69,7 +131,7 @@ are in Kafka and the offset is stored. Then:
 | `restart` | Kafka Connect is stopped, 50 rows are inserted (`down`), Connect starts, 50 more rows (`after`) |
 | `ddl` | 100 rows are inserted at 10 per second (`during`); after 5 s the DDL runs; a FAILED task is restarted up to 3 times, like an external auto-restart; 50 more rows (`after`) |
 | `ddl-caught-up` | the DDL runs, then 50 rows (`after`) |
-| `changes` | Kafka Connect is stopped; 50 rows (`kept`) are inserted, updated with a new CLOB, updated without touching the CLOB; 50 more rows (`deleted`) get the same and are then deleted; Connect starts. The report lists every event and whether it carried its own CLOB version |
+| `changes` | Kafka Connect is stopped; 50 rows (`kept`) are inserted, updated with a new CLOB, updated without touching the CLOB; 50 more rows (`deleted`) get the same and are then deleted; Connect starts. The report shows each change in the table next to what reached Kafka, then the end state per row |
 | `archive-gone` | Kafka Connect is stopped, 50 rows are inserted (`gone`), the logs are switched and every archive log is deleted with RMAN, Connect starts, 50 more rows (`after`) |
 
 ## Results (Debezium 3.7.0)
