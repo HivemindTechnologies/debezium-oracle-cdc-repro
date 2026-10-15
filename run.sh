@@ -86,32 +86,70 @@ kafka_rows() {
              | "\($n) \(if (.EV_DATA // "" | startswith($n + ":")) then "ok" else "bad" end)"'
 }
 
-# one line per event: "<phase> <event> <clob>", clob is ok (its own version), empty or wrong
+# one line per event, in Kafka order: "<phase> <event> <clob> <row>", clob is the version the
+# event carried (v1, v2, empty, other), row is the row's name without the :v2 suffix
 kafka_events() {
   docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server kafka:9092 --topic "$run.APP.EVENTS" --from-beginning --timeout-ms 10000 2>/dev/null \
     | jq -r 'select(. != null and .op != "r")
-             | if .op == "d" then "\(.before.EV_NAME | split(":")[1]) delete -"
+             | if .op == "d" then "\(.before.EV_NAME | split(":")[1]) delete - \(.before.EV_NAME | sub(":v2$"; ""))"
                else .after as $a
                  | (if .op == "c" then "insert" elif $a.EV_NOTE == null then "update-clob" else "update-note" end) as $e
                  | ($a.EV_DATA // "") as $d
-                 | (if ($d | startswith($a.EV_NAME + ":x")) then "ok" elif $d == "" then "empty" else "wrong" end) as $c
-                 | "\($a.EV_NAME | split(":")[1]) \($e) \($c)"
+                 | ($a.EV_NAME | sub(":v2$"; "")) as $row
+                 | (if ($d | startswith($row + ":x")) then "v1" elif ($d | startswith($row + ":v2:x")) then "v2"
+                    elif $d == "" then "empty" else "other" end) as $c
+                 | "\($a.EV_NAME | split(":")[1]) \($e) \($c) \($row)"
                end'
 }
 
+# For each group of 50 rows: every change made in the table, next to what reached Kafka for it,
+# then the end state. A target is correct if the last event per row matches the table.
 change_report() {
   step "counting events in Kafka"
+  local events last
+  events=$(kafka_events)
+  last=$(awk '{ last[$4] = $1 " " ($2 == "delete" ? "delete" : $3) } END { for (r in last) print last[r] }' <<< "$events")
   echo
   echo "task: $(state)"
-  printf '%-8s %-12s %-6s %6s\n' phase event clob events
-  local events; events=$(kafka_events)
   for phase in kept deleted; do
-    for event in insert update-clob update-note delete; do
-      grep "^$phase $event " <<< "$events" | sort | uniq -c \
-        | awk '{ printf "%-8s %-12s %-6s %6s\n", $2, $3, $4, $1 }' || true
-    done
+    echo
+    echo "$phase (50 rows)"
+    printf '  %-34s     %s\n' "in the table" "in Kafka"
+    change_line "$phase" insert      v1 "insert, CLOB v1"
+    change_line "$phase" update-clob v2 "update, CLOB v2"
+    change_line "$phase" update-note v2 "update, other column"
+    if [ "$phase" = kept ]; then
+      end_line kept v2 "end: $(in_db kept) rows, CLOB v2"
+    else
+      change_line deleted delete - "delete"
+      end_line deleted delete "end: $(in_db deleted) rows"
+    fi
   done
+}
+
+# change_line <phase> <event> <expected version or -> <label>
+change_line() {
+  local lines all detail="" count
+  lines=$(grep "^$1 $2 " <<< "$events" || true)
+  all=$(grep -c . <<< "$lines" || true)
+  for version in v1 v2 empty other; do
+    count=$(grep -c " $version " <<< "$lines" || true)
+    [ "$count" -gt 0 ] && [ "$3" != - ] && detail="$detail, $count $version"
+  done
+  local verdict=ok
+  [ "$all" -eq 50 ] || verdict="<- $((50 - all)) missing"
+  if [ "$3" != - ] && [ "$all" -eq 50 ]; then
+    count=$(grep -c " $3 " <<< "$lines" || true)
+    [ "$count" -eq 50 ] || verdict="<- $((50 - count)) not $3"
+  fi
+  printf '  %-34s ->  %-26s %s\n' "$4" "$all events$detail" "$verdict"
+}
+
+# end_line <phase> <expected last event> <label>: the last event per row decides the target's state
+end_line() {
+  local count; count=$(grep -c "^$1 $2$" <<< "$last" || true)
+  printf '  %-34s ->  %-26s %s\n' "$3" "last event: $count $2" "$([ "$count" -eq 50 ] && echo ok || echo "<- $((50 - count)) rows end wrong")"
 }
 
 # count <phase> [ok] from kafka_rows output on stdin: rows in Kafka, or rows with a correct CLOB
@@ -262,6 +300,7 @@ case "$scenario" in
     docker compose start connect >/dev/null 2>&1
     wait_for 300 streaming
     sleep 30
+    resume_point
     change_report
     ;;
 
