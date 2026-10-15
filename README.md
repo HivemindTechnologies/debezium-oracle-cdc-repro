@@ -96,12 +96,8 @@ ends correct (kept rows on v2, deleted rows with a delete).
 ```bash
 ./run.sh archive-gone production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
 ```
-`task FAILED: no longer available on the server`. It waits for someone to act.
-
-```bash
-./run.sh archive-gone production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json snapshot.mode=when_needed
-```
-A full snapshot of the table, then streaming: all 50 `gone` rows arrive.
+`task FAILED: no longer available on the server`. The connector stops loudly; the gap is
+repaired by hand (runbook: move the offset, incremental snapshot).
 
 ### 5. A Constraint in the Same Statement (Debezium 3.6.1)
 
@@ -162,10 +158,7 @@ flashback read.
 |---|---|---|
 | `configuration_based` (`production.json`) | FAILED: `no longer available on the server` | 0, `after` 0 |
 | `no_data` (layer 1) | FAILED: `no longer available on the server` | 0, `after` 0 |
-| `when_needed` | full snapshot of the table, then streaming | 50 / 50, with CLOBs |
-
-`when_needed_no_data` exists in Debezium, but the Oracle connector does not accept it.
-On a normal restart `when_needed` resumes at the stored offset like `no_data`.
+Both stop and wait; nothing is skipped silently. The gap is repaired by hand.
 
 ### Debezium Versions
 
