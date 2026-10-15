@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# usage: ./run.sh restart|ddl|ddl-caught-up production.json|recommended.json [key=value ...]
+# usage: ./run.sh restart|ddl|ddl-caught-up|changes|archive-gone production.json|recommended.json [key=value ...]
 #   key=value pairs override single keys of the config file, e.g. snapshot.mode=no_data
 #   DDL="..." replaces the DDL; COL becomes a column name unique to the run
 set -euo pipefail
 cd "$(dirname "$0")"
 
-usage="usage: ./run.sh restart|ddl|ddl-caught-up production.json|recommended.json [key=value ...]"
+usage="usage: ./run.sh restart|ddl|ddl-caught-up|changes|archive-gone production.json|recommended.json [key=value ...]"
 scenario=${1:?$usage}
 config=${2:?$usage}
 shift 2
@@ -34,6 +34,36 @@ END;
 SQL
 }
 
+# change <phase>: per row, one update with a new CLOB (name and CLOB get the suffix :v2), then
+# one update that only touches EV_NOTE and leaves the CLOB alone
+change() {
+  sql >/dev/null <<SQL
+DECLARE v CLOB;
+BEGIN
+  FOR r IN (SELECT EV_ID id, EV_NAME n FROM APP.EVENTS WHERE EV_NAME LIKE '$run:$1:%') LOOP
+    v := RPAD(r.n || ':v2:', 8000, 'x');
+    UPDATE APP.EVENTS SET EV_NAME = r.n || ':v2', EV_DATA = v WHERE EV_SITE = 'A' AND EV_ID = r.id;
+    COMMIT;
+    UPDATE APP.EVENTS SET EV_NOTE = 'note' WHERE EV_SITE = 'A' AND EV_ID = r.id;
+    COMMIT;
+  END LOOP;
+END;
+/
+SQL
+}
+
+delete_rows() { sql >/dev/null <<< "DELETE FROM APP.EVENTS WHERE EV_NAME LIKE '$run:$1:%';
+COMMIT;"; }
+
+# Switch logs until the online redo holds nothing older, then delete every archive log, as a
+# deletion policy under disk pressure would.
+drop_archives() {
+  docker compose exec -T oracle sqlplus -s / as sysdba >/dev/null <<< "ALTER SYSTEM ARCHIVE LOG CURRENT;
+ALTER SYSTEM ARCHIVE LOG CURRENT;
+ALTER SYSTEM ARCHIVE LOG CURRENT;"
+  docker compose exec -T oracle bash -lc 'rman target / <<< "DELETE NOPROMPT ARCHIVELOG ALL;"' >/dev/null
+}
+
 # The DDL waits up to 30 s for the table lock, as ongoing inserts hold it briefly; without the
 # timeout it fails with ORA-00054. Any error aborts the run.
 run_ddl() {
@@ -52,8 +82,36 @@ SELECT COUNT(*) FROM APP.EVENTS WHERE EV_NAME LIKE '$run:$1:%';" | tr -d '[:spac
 kafka_rows() {
   docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server kafka:9092 --topic "$run.APP.EVENTS" --from-beginning --timeout-ms 10000 2>/dev/null \
-    | jq -r 'select(.op == "c") | .after | .EV_NAME as $n
+    | jq -r 'select(.op == "c" or .op == "r") | .after | .EV_NAME as $n
              | "\($n) \(if (.EV_DATA // "" | startswith($n + ":")) then "ok" else "bad" end)"'
+}
+
+# one line per event: "<phase> <event> <clob>", clob is ok (its own version), empty or wrong
+kafka_events() {
+  docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server kafka:9092 --topic "$run.APP.EVENTS" --from-beginning --timeout-ms 10000 2>/dev/null \
+    | jq -r 'select(. != null and .op != "r")
+             | if .op == "d" then "\(.before.EV_NAME | split(":")[1]) delete -"
+               else .after as $a
+                 | (if .op == "c" then "insert" elif $a.EV_NOTE == null then "update-clob" else "update-note" end) as $e
+                 | ($a.EV_DATA // "") as $d
+                 | (if ($d | startswith($a.EV_NAME + ":x")) then "ok" elif $d == "" then "empty" else "wrong" end) as $c
+                 | "\($a.EV_NAME | split(":")[1]) \($e) \($c)"
+               end'
+}
+
+change_report() {
+  step "counting events in Kafka"
+  echo
+  echo "task: $(state)"
+  printf '%-8s %-12s %-6s %6s\n' phase event clob events
+  local events; events=$(kafka_events)
+  for phase in kept deleted; do
+    for event in insert update-clob update-note delete; do
+      grep "^$phase $event " <<< "$events" | sort | uniq -c \
+        | awk '{ printf "%-8s %-12s %-6s %6s\n", $2, $3, $4, $1 }' || true
+    done
+  done
 }
 
 # count <phase> [ok] from kafka_rows output on stdin: rows in Kafka, or rows with a correct CLOB
@@ -79,7 +137,8 @@ running() { [ "$(state)" = RUNNING ]; }
 started() { [ "$(state)" = RUNNING ] || [ "$(state)" = FAILED ]; }
 offset_stored() { curl -s "$api/connectors/$run/offsets" | jq -e '.offsets | length > 0'; }
 # the task reports RUNNING before its startup snapshot is done; streaming starts after it
-streaming() { docker compose logs --since "$since" connect | grep -q 'Starting streaming'; }
+# grep -c reads the whole log; grep -q would stop early and fail the pipeline with SIGPIPE
+streaming() { [ "$(docker compose logs --since "$since" connect 2>/dev/null | grep -c 'Starting streaming')" -gt 0 ]; }
 all_delivered() { [ "$(in_kafka "$1")" -eq "$(in_db "$1")" ]; }
 
 start_connector() {
@@ -137,7 +196,7 @@ report() {
 }
 
 echo "== $scenario $config ${*:-} ($run)"
-[ "$scenario" = restart ] || echo "DDL: $ddl"
+case "$scenario" in ddl*) echo "DDL: $ddl" ;; esac
 start_connector "$@"
 step "inserting 50 rows (before)"
 insert before 50
@@ -187,6 +246,43 @@ case "$scenario" in
     insert after 50
     sleep 20
     report before after
+    ;;
+
+  changes)
+    step "stopping Kafka Connect, so every CLOB is read back late"
+    docker compose stop connect >/dev/null 2>&1
+    step "50 rows (kept): insert, update with new CLOB, update without CLOB"
+    insert kept 50
+    change kept
+    step "50 rows (deleted): the same, then delete"
+    insert deleted 50
+    change deleted
+    delete_rows deleted
+    step "starting Kafka Connect, waiting for streaming"
+    docker compose start connect >/dev/null 2>&1
+    wait_for 300 streaming
+    sleep 30
+    change_report
+    ;;
+
+  archive-gone)
+    step "stopping Kafka Connect"
+    docker compose stop connect >/dev/null 2>&1
+    step "inserting 50 rows while it is down (gone)"
+    insert gone 50
+    step "switching logs and deleting all archive logs with RMAN"
+    drop_archives
+    step "starting Kafka Connect"
+    docker compose start connect >/dev/null 2>&1
+    wait_for 300 api_up
+    sleep 20
+    wait_for 120 started
+    [ "$(state)" = FAILED ] && step "task FAILED: $(curl -s "$api/connectors/$run/status" | jq -r '.tasks[0].trace' | grep -m1 -o 'Online REDO LOG files or archive log files do not contain.*\|no longer available.*' || true)"
+    step "inserting 50 rows (after), waiting 20 s"
+    insert after 50
+    sleep 20
+    resume_point
+    report before gone after
     ;;
 
   *) echo "unknown scenario: $scenario" >&2; exit 1 ;;

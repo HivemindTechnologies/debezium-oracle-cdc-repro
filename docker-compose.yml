@@ -1,7 +1,8 @@
 services:
   # Prebuilt database, first start takes ~2 min. CDB FREE, PDB FREEPDB1.
+  # The full image, because the archive-gone scenario needs RMAN, which -slim lacks.
   oracle:
-    image: gvenzl/oracle-free:23-slim
+    image: gvenzl/oracle-free:23
     environment:
       ORACLE_PASSWORD: oracle
     volumes:
@@ -26,8 +27,9 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
 
+  # 3.6.1, not 3.7.0: 3.7.0 stops for good when a CLOB read-back hits ORA-01555 (see README).
   connect:
-    image: quay.io/debezium/connect:3.7.0.Final
+    image: quay.io/debezium/connect:3.6.1.Final
     depends_on:
       oracle:
         condition: service_healthy
