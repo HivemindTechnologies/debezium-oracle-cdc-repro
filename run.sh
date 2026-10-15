@@ -116,6 +116,7 @@ change_report() {
   last=$(awk '{ last[$4] = $1 " " ($2 == "delete" ? "delete" : $3) } END { for (r in last) print last[r] }' <<< "$events")
   echo
   echo "task: $(state)"
+  [ "$(state)" = FAILED ] && echo "      $(reason)"
   for phase in kept deleted; do
     echo
     echo "$phase (50 rows)"
@@ -165,6 +166,13 @@ step() { echo "$(date +%T)  $*"; }
 
 state() { curl -s "$api/connectors/$run/status" | jq -r '.tasks[0].state // "STARTING"'; }
 
+# why the task failed: the known Debezium messages, otherwise the first "Caused by" line
+reason() {
+  local trace; trace=$(curl -s "$api/connectors/$run/status" | jq -r '.tasks[0].trace // ""')
+  grep -m1 -o -E 'Oracle LogMiner is unable.*|no longer available.*|Invalid value: .*' <<< "$trace" \
+    || grep -m1 'Caused by' <<< "$trace" || true
+}
+
 # wait_for <seconds> <command...>: poll until the command succeeds
 wait_for() {
   local deadline=$((SECONDS + $1)); shift
@@ -202,13 +210,16 @@ start_connector() {
   fi
 }
 
-# restart a FAILED task up to 3 times, as an external auto-restart would
+# restart a FAILED task up to 3 times, as an external auto-restart would. The offset stored at the
+# first failure is what a restart must resume from.
 auto_restart() {
+  local failed=no
   for i in 1 2 3; do
     step "checking task in 20 s ($i/3)"
     sleep 20
     running && { step "task RUNNING"; continue; }
-    step "task FAILED: $(curl -s "$api/connectors/$run/status" | jq -r '.tasks[0].trace' | grep -m1 -o 'Oracle LogMiner is unable.*')"
+    step "task FAILED: $(reason)"
+    [ $failed = yes ] || { stored=$(stored_scn); failed=yes; }
     curl -sf -X POST "$api/connectors/$run/tasks/0/restart"
     step "task restarted"
   done
@@ -231,6 +242,7 @@ report() {
   echo
   local rows; rows=$(kafka_rows)
   echo "task: $(state)"
+  [ "$(state)" = FAILED ] && echo "      $(reason)"
   printf '%-8s %6s %6s %8s\n' phase db kafka clob-ok
   for phase in "$@"; do
     printf '%-8s %6s %6s %8s\n' "$phase" "$(in_db "$phase")" "$(count "$phase" <<< "$rows")" "$(count "$phase" ok <<< "$rows")"
@@ -320,7 +332,7 @@ case "$scenario" in
     wait_for 300 api_up
     sleep 20
     wait_for 120 started
-    [ "$(state)" = FAILED ] && step "task FAILED: $(curl -s "$api/connectors/$run/status" | jq -r '.tasks[0].trace' | grep -m1 -o 'Online REDO LOG files or archive log files do not contain.*\|no longer available.*' || true)"
+    [ "$(state)" = FAILED ] && step "task FAILED: $(reason)"
     step "inserting 50 rows (after), waiting 20 s"
     insert after 50
     sleep 20
