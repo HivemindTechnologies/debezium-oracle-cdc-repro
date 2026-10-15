@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# usage: ./run.sh restart|ddl|ddl-caught-up|changes|archive-gone production.json|recommended.json [key=value ...]
-#   key=value pairs override single keys of the config file, e.g. snapshot.mode=no_data
+# usage: ./run.sh <scenario> production.json [layer.json ...] [key=value ...]
+#   scenarios: restart, ddl, ddl-caught-up, changes, archive-gone
+#   layer files are merged onto production.json from left to right, e.g. 1-no-data.json;
+#   key=value pairs override single keys last, e.g. snapshot.mode=when_needed
 #   DDL="..." replaces the DDL; COL becomes a column name unique to the run
 set -euo pipefail
 cd "$(dirname "$0")"
 
-usage="usage: ./run.sh restart|ddl|ddl-caught-up|changes|archive-gone production.json|recommended.json [key=value ...]"
+usage="usage: ./run.sh restart|ddl|ddl-caught-up|changes|archive-gone production.json [layer.json ...] [key=value ...]"
 scenario=${1:?$usage}
-config=${2:?$usage}
-shift 2
+shift
+configs=()
+while [ $# -gt 0 ] && [[ $1 == *.json ]]; do configs+=("$1"); shift; done
+[ ${#configs[@]} -gt 0 ] || { echo "$usage" >&2; exit 1; }
 run=r$(date +%H%M%S)   # tags the rows and names the connector and its topics
 api=http://localhost:8083
 ddl=${DDL:-ALTER TABLE APP.EVENTS ADD COL VARCHAR2(40 CHAR)}
@@ -186,7 +190,7 @@ start_connector() {
   local t0; t0=$(date -u +%FT%TZ)
   for old in $(curl -s "$api/connectors" | jq -r '.[]'); do curl -s -X DELETE "$api/connectors/$old"; done
   jq -n --args '$ARGS.positional | map(split("=") | {(.[0]): (.[1:] | join("="))}) | add // {}' "$@" \
-    | jq --arg run "$run" --slurpfile base "$config" \
+    | jq --arg run "$run" --slurpfile base <(jq -s add "${configs[@]}") \
         '{name: $run, config: ($base[0] + {"topic.prefix": $run, "schema.history.internal.kafka.topic": "\($run).history"} + .)}' \
     | curl -s --fail-with-body -X POST -H 'Content-Type: application/json' --data @- "$api/connectors" >/tmp/connector-response.json \
     || { echo "connector rejected: $(jq -r .message /tmp/connector-response.json)" >&2; exit 1; }
@@ -233,7 +237,7 @@ report() {
   done
 }
 
-echo "== $scenario $config ${*:-} ($run)"
+echo "== $scenario ${configs[*]} ${*:-} ($run)"
 case "$scenario" in ddl*) echo "DDL: $ddl" ;; esac
 start_connector "$@"
 step "inserting 50 rows (before)"

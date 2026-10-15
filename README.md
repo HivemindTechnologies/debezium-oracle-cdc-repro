@@ -9,7 +9,7 @@ Two things lose change events in the production setup:
    `Oracle LogMiner is unable to re-construct the SQL for 'INSERT' event`. The next restart
    then skips everything since the stored offset.
 
-The recommended configuration loses nothing in either case.
+Four layers on top of `production.json` fix this; with all four, nothing is lost.
 
 ## Run
 
@@ -20,36 +20,42 @@ docker compose up -d                         # first start ~3 min
 ./run.sh restart production.json             # restart
 ./run.sh ddl production.json                 # DDL while the connector is a few seconds behind
 ./run.sh ddl-caught-up production.json       # DDL while the connector is idle
-./run.sh ddl recommended.json                # any scenario, recommended configuration
 docker compose down -v                       # remove everything
 ```
 
-| File | Configuration |
-|---|---|
-| `production.json` | as in production: `lob.enabled=true`, `online_catalog`, filter mode `in`, CLOB reselector, `snapshot.mode=configuration_based` with `snapshot.schema=true` |
-| `recommended.json` | the same with `snapshot.mode=no_data`, `log.mining.strategy=hybrid`, `lob.enabled=false`, `unavailable.value.placeholder=""` |
+`production.json` is the configuration as in production: `lob.enabled=true`, `online_catalog`,
+filter mode `in`, the CLOB reselector, `snapshot.mode=configuration_based` with
+`snapshot.schema=true`. Each layer file holds one fix and is merged on top, left to right:
 
-Single keys can be overridden after the file, e.g. `./run.sh ddl recommended.json lob.enabled=true`.
+| Layer | Setting | Fixes |
+|---|---|---|
+| `1-no-data.json` | `snapshot.mode=no_data` | a restart resumes at the stored offset instead of skipping ahead |
+| `2-lob-disabled-reselector.json` | `lob.enabled=false` | CLOBs come from the reselector; needed for layer 3 |
+| `3-hybrid.json` | `log.mining.strategy=hybrid` | a DDL no longer stops the connector |
+| `4-empty-placeholder.json` | `unavailable.value.placeholder=""` | rows rebuilt by `hybrid` get their CLOB from the reselector |
+
+`key=value` pairs after the files override single keys, e.g. `snapshot.mode=when_needed`.
 `DDL="..."` replaces the DDL; `COL` becomes a fresh column name. Each run creates a fresh
 connector.
 
 ## Step by Step
 
-Start from production and add one setting at a time; each step fixes what the previous one
-showed:
+Add one layer at a time; each step fixes what the previous one showed:
 
 ```bash
-./run.sh restart production.json                          # restart: rows written while down are lost
-./run.sh restart production.json snapshot.mode=no_data    # nothing lost
+L="production.json 1-no-data.json"
+./run.sh restart production.json      # rows written while Connect was down are lost
+./run.sh restart $L                   # nothing lost
 
-./run.sh ddl production.json snapshot.mode=no_data        # DDL: task stays FAILED, nothing lost
-./run.sh ddl production.json snapshot.mode=no_data \
-  log.mining.strategy=hybrid                              # rejected: hybrid needs lob.enabled=false
-./run.sh ddl production.json snapshot.mode=no_data \
-  log.mining.strategy=hybrid lob.enabled=false            # passes the DDL, some CLOBs arrive empty
-./run.sh ddl production.json snapshot.mode=no_data \
-  log.mining.strategy=hybrid lob.enabled=false \
-  unavailable.value.placeholder=                          # all rows, all CLOBs: this is recommended.json
+./run.sh ddl $L                       # DDL: task stays FAILED, nothing lost
+./run.sh ddl $L 3-hybrid.json         # rejected: hybrid needs lob.enabled=false
+
+L="$L 2-lob-disabled-reselector.json"
+./run.sh ddl $L 3-hybrid.json         # passes the DDL, some CLOBs arrive empty
+
+L="$L 3-hybrid.json 4-empty-placeholder.json"
+./run.sh ddl $L                       # all rows, all CLOBs
+./run.sh changes $L                   # updates and deletes: every row ends correct
 ```
 
 ## Scenarios
@@ -70,7 +76,7 @@ are in Kafka and the offset is stored. Then:
 
 Rows of the `down`, `during` or `after` phase in Kafka, with their own CLOB:
 
-| Run | `production.json` | `recommended.json` |
+| Run | `production.json` | with all four layers |
 |---|---|---|
 | `restart` | **0 / 50**, resumed at 2301595 instead of 2300998 | 50 / 50 |
 | `ddl`, `ADD COL VARCHAR2(40 CHAR)` | **36 / 100**, failed, restart skipped to 2304178 | 100 / 100, never failed |
@@ -80,7 +86,7 @@ Rows of the `down`, `during` or `after` phase in Kafka, with their own CLOB:
 Each run prints `stored offset` (where the connector stopped) and `resumed from` (where it
 continued). If they differ, everything in between is skipped.
 
-### Updates and Deletes (`changes`, Debezium 3.6.1, `recommended.json`)
+### Updates and Deletes (`changes`, Debezium 3.6.1, all four layers)
 
 Every event of the 100 rows arrived, 399 of 400 with their own CLOB version. One insert event
 carried the CLOB of the later update: the old version was gone (`ORA-01555`), so Debezium read the
@@ -93,7 +99,7 @@ flashback read.
 | `snapshot.mode` | Result | `gone` rows in Kafka |
 |---|---|---|
 | `configuration_based` (`production.json`) | FAILED: `no longer available on the server` | 0, `after` 0 |
-| `no_data` (`recommended.json`) | FAILED: `no longer available on the server` | 0, `after` 0 |
+| `no_data` (layer 1) | FAILED: `no longer available on the server` | 0, `after` 0 |
 | `when_needed` | full snapshot of the table, then streaming | 50 / 50, with CLOBs |
 
 `when_needed_no_data` exists in Debezium, but the Oracle connector does not accept it.
