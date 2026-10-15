@@ -9,7 +9,7 @@ Two things lose change events in the production setup:
    `Oracle LogMiner is unable to re-construct the SQL for 'INSERT' event`. The next restart
    then skips everything since the stored offset.
 
-Four layers on top of `production.json` fix this; with all four, nothing is lost.
+Four layers on top of `0-production.json` fix this; with all four, nothing is lost.
 
 ## Run
 
@@ -20,8 +20,8 @@ docker compose up -d        # first start ~3 min
 docker compose down -v      # remove everything at the end
 ```
 
-`./run.sh <scenario> production.json [layer.json ...] [key=value ...]` creates a fresh connector,
-runs the scenario and prints what reached Kafka. `production.json` is the configuration as in
+`./run.sh <scenario> 0-production.json [layer.json ...] [key=value ...]` creates a fresh connector,
+runs the scenario and prints what reached Kafka. `0-production.json` is the configuration as in
 production: `lob.enabled=true`, `online_catalog`, filter mode `in`, the CLOB reselector,
 `snapshot.mode=configuration_based` with `snapshot.schema=true`. Each layer file holds one fix and
 is merged on top, left to right; `key=value` pairs override single keys last.
@@ -40,61 +40,61 @@ Each command runs on its own; copy them in order. The comment says what to look 
 ### 1. A Restart Loses Data
 
 ```bash
-./run.sh restart production.json
+./run.sh restart 0-production.json
 ```
 `down 50 0`: the 50 rows written while Connect was down never arrive; `resumed from` is higher
 than `stored offset`.
 
 ```bash
-./run.sh restart production.json 1-no-data.json
+./run.sh restart 0-production.json 1-no-data.json
 ```
 `down 50 50`: the restart resumes at the stored offset.
 
 ### 2. A DDL Stops the Connector
 
 ```bash
-./run.sh ddl production.json
+./run.sh ddl 0-production.json
 ```
 `task FAILED: … unable to re-construct the SQL …`, then the auto-restart skips ahead: most
 `during` rows are lost.
 
 ```bash
-./run.sh ddl production.json 1-no-data.json
+./run.sh ddl 0-production.json 1-no-data.json
 ```
 The task stays FAILED on every restart. Nothing is lost, but nothing moves either.
 
 ```bash
-./run.sh ddl production.json 1-no-data.json 3-hybrid.json
+./run.sh ddl 0-production.json 1-no-data.json 3-hybrid.json
 ```
 Rejected at start: `hybrid` is not compatible with `lob.enabled=true`.
 
 ```bash
-./run.sh ddl production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json
+./run.sh ddl 0-production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json
 ```
 The DDL passes and all 100 `during` rows arrive, but about 14 of them with an empty CLOB.
 
 ```bash
-./run.sh ddl production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
+./run.sh ddl 0-production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
 ```
 All rows, all CLOBs.
 
 ### 3. Updates and Deletes With the Reselector
 
 ```bash
-./run.sh changes production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
+./run.sh changes 0-production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
 ```
 Every line ends in `ok`: each change in the table arrives with its CLOB version, and every row
 ends correct (kept rows on v2, deleted rows with a delete).
 
 ```bash
-./run.sh changes production.json
+./run.sh changes 0-production.json
 ```
 `0 events` on every line: the restart skipped all changes.
 
 ### 4. Archive Logs Deleted While the Connector Is Down
 
 ```bash
-./run.sh archive-gone production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
+./run.sh archive-gone 0-production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
 ```
 `task FAILED: no longer available on the server`. The connector stops loudly; the gap is
 repaired by hand (runbook: move the offset, incremental snapshot).
@@ -103,13 +103,13 @@ repaired by hand (runbook: move the offset, incremental snapshot).
 
 ```bash
 DDL="ALTER TABLE APP.EVENTS ADD (COL VARCHAR2(1 CHAR) DEFAULT 'N' NOT NULL, CONSTRAINT COL_CK CHECK (COL IN ('N','Y')))" \
-  ./run.sh ddl-caught-up production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
+  ./run.sh ddl-caught-up 0-production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
 ```
 FAILED with `Invalid value: null used for required field: "typeName"`, even with no lag.
 
 ```bash
 DDL=$'ALTER TABLE APP.EVENTS ADD (COL VARCHAR2(1 CHAR) DEFAULT \'N\' NOT NULL);\nALTER TABLE APP.EVENTS ADD CONSTRAINT COL_CK CHECK (COL IN (\'N\',\'Y\'))' \
-  ./run.sh ddl production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
+  ./run.sh ddl 0-production.json 1-no-data.json 2-lob-disabled-reselector.json 3-hybrid.json 4-empty-placeholder.json
 ```
 The same change as two statements passes, also with writes running.
 
@@ -134,7 +134,7 @@ are in Kafka and the offset is stored. Then:
 
 Rows of the `down`, `during` or `after` phase in Kafka, with their own CLOB:
 
-| Run | `production.json` | with all four layers |
+| Run | `0-production.json` | with all four layers |
 |---|---|---|
 | `restart` | **0 / 50**, resumed at 2301595 instead of 2300998 | 50 / 50 |
 | `ddl`, `ADD COL VARCHAR2(40 CHAR)` | **36 / 100**, failed, restart skipped to 2304178 | 100 / 100, never failed |
@@ -156,7 +156,7 @@ flashback read.
 
 | `snapshot.mode` | Result | `gone` rows in Kafka |
 |---|---|---|
-| `configuration_based` (`production.json`) | FAILED: `no longer available on the server` | 0, `after` 0 |
+| `configuration_based` (`0-production.json`) | FAILED: `no longer available on the server` | 0, `after` 0 |
 | `no_data` (layer 1) | FAILED: `no longer available on the server` | 0, `after` 0 |
 Both stop and wait; nothing is skipped silently. The gap is repaired by hand.
 

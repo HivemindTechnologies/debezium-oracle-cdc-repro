@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# usage: ./run.sh <scenario> production.json [layer.json ...] [key=value ...]
+# usage: ./run.sh <scenario> 0-production.json [layer.json ...] [key=value ...]
 #   scenarios: restart, ddl, ddl-caught-up, changes, archive-gone
-#   layer files are merged onto production.json from left to right, e.g. 1-no-data.json;
+#   layer files are merged onto 0-production.json from left to right, e.g. 1-no-data.json;
 #   key=value pairs override single keys last, e.g. lob.enabled=true
 #   DDL="..." replaces the DDL; COL becomes a column name unique to the run
 set -euo pipefail
 cd "$(dirname "$0")"
 
-usage="usage: ./run.sh restart|ddl|ddl-caught-up|changes|archive-gone production.json [layer.json ...] [key=value ...]"
+usage="usage: ./run.sh restart|ddl|ddl-caught-up|changes|archive-gone 0-production.json [layer.json ...] [key=value ...]"
 scenario=${1:?$usage}
 shift
 configs=()
