@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # usage: ./run.sh <scenario> 0-production.json [layer.json ...] [key=value ...]
-#   scenarios: restart, ddl, ddl-caught-up, changes, archive-gone
+#   scenarios: restart, ddl, ddl-caught-up, changes, archive-gone, reorg
+#   REORG_SECONDS=... sets how long the reorg transaction stays open (default 300)
 #   layer files are merged onto 0-production.json from left to right, e.g. 1-no-data.json;
 #   key=value pairs override single keys last, e.g. lob.enabled=true
 #   DDL="..." replaces the DDL; COL becomes a column name unique to the run
 set -euo pipefail
 cd "$(dirname "$0")"
 
-usage="usage: ./run.sh restart|ddl|ddl-caught-up|changes|archive-gone 0-production.json [layer.json ...] [key=value ...]"
+usage="usage: ./run.sh restart|ddl|ddl-caught-up|changes|archive-gone|reorg 0-production.json [layer.json ...] [key=value ...]"
 scenario=${1:?$usage}
 shift
 configs=()
@@ -54,6 +55,55 @@ BEGIN
 END;
 /
 SQL
+}
+
+# reorg <seconds>: one transaction in the uncaptured schema REORG that inserts and deletes 200
+# rows of 2 KB in a loop and commits only at the end, like a mass delete of a reorg job. About
+# 5 MB of redo per second; the connector filters all of it out, except the transaction's start.
+reorg() {
+  docker compose exec -T oracle sqlplus -s reorg/reorg@localhost:1521/FREEPDB1 >/dev/null <<SQL
+DECLARE t0 NUMBER := DBMS_UTILITY.GET_TIME;
+BEGIN
+  WHILE DBMS_UTILITY.GET_TIME - t0 < $1 * 100 LOOP
+    INSERT INTO REORG.JUNK SELECT LEVEL, RPAD('x', 2000, 'x') FROM DUAL CONNECT BY LEVEL <= 200;
+    DELETE FROM REORG.JUNK;
+    DBMS_SESSION.SLEEP(0.2);
+  END LOOP;
+  COMMIT;
+END;
+/
+SQL
+}
+
+redo_mb() {
+  docker compose exec -T oracle sqlplus -s / as sysdba <<< "SET HEADING OFF FEEDBACK OFF
+SELECT ROUND(value/1024/1024) FROM v\$sysstat WHERE name = 'redo size';" | tr -d '[:space:]'
+}
+
+# Per 30 rows of <phase> (inserted 1 per second): the largest delay from the commit in Oracle
+# (source.ts_ms) to the event leaving Debezium (ts_ms).
+lag_report() {
+  docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server kafka:9092 --topic "$run.APP.EVENTS" --from-beginning --timeout-ms 10000 2>/dev/null \
+    | jq -r --arg p "$run:$1:" 'select(.op == "c" and (.after.EV_NAME | startswith($p)))
+             | "\(.after.EV_NAME | split(":")[2]) \((.ts_ms - .source.ts_ms) / 1000 | floor)"' \
+    | sort -n | awk '{ b = int(($1 - 1) / 30); if ($2 > max[b]) max[b] = $2; n[b]++ }
+        END { for (i = 0; i in n; i++) printf "  rows %3d-%3d   max lag %4d s\n", i*30+1, i*30+n[i], max[i] }'
+}
+
+# The LogMiner sessions since $since, from Debezium's DEBUG log: how many there were, how many
+# distinct start SCNs they had, and how far the last one reached back from its end.
+session_report() {
+  docker compose logs --since "$since" connect 2>/dev/null \
+    | sed -n -E 's/.*Starting mining session \[startScn=([0-9]+), endScn=([0-9]+).*/\1 \2/p' \
+    | awk '{ n++; if (!($1 in seen)) { seen[$1]; d++ } w = $2 - $1; if (w > maxw) maxw = w }
+        END { printf "mining sessions %d, distinct start SCNs %d, widest session %d SCNs\n", n, d, maxw }'
+}
+
+# the row numbers of <phase> that are in the database but not in Kafka
+missing() {
+  comm -23 <(seq 1 "$(in_db "$1")" | sort) <(kafka_rows | grep -o "^$run:$1:[0-9]*" | cut -d: -f3 | sort -u) \
+    | sort -n | tr '\n' ' '
 }
 
 delete_rows() { sql >/dev/null <<< "DELETE FROM APP.EVENTS WHERE EV_NAME LIKE '$run:$1:%';
@@ -338,6 +388,28 @@ case "$scenario" in
     sleep 20
     resume_point
     report before gone after
+    ;;
+
+  reorg)
+    secs=${REORG_SECONDS:-300}
+    for logger in logminer.AbstractLogMinerStreamingChangeEventSource logminer.buffered.BufferedLogMinerStreamingChangeEventSource; do
+      curl -s -X PUT -H 'Content-Type: application/json' -d '{"level": "DEBUG"}' \
+        "$api/admin/loggers/io.debezium.connector.oracle.$logger" >/dev/null
+    done
+    redo0=$(redo_mb)
+    step "reorg transaction open for $secs s, meanwhile 1 row per second (during)"
+    reorg "$secs" &
+    insert during "$secs" 1
+    wait
+    step "reorg committed, $(( $(redo_mb) - redo0 )) MB redo; inserting 5 rows (after)"
+    # A lost row never arrives, so waiting for all of during would hang. Once after is in Kafka,
+    # the connector has read past every during row; what is missing then stays missing.
+    insert after 5
+    wait_for 1800 all_delivered after
+    report during after
+    echo "missing         $(missing during)"
+    session_report
+    lag_report during
     ;;
 
   *) echo "unknown scenario: $scenario" >&2; exit 1 ;;
